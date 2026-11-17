@@ -89,3 +89,47 @@ sys_uptime(void)
   release(&tickslock);
   return xticks;
 }
+
+int
+sys_sem_init(void)
+{
+  int id, value;
+  if(argint(0, &id) < 0)
+    return -1;
+  if(argint(1, &value) < 0)
+    return -1;
+  return ksem_init(id, value);
+}
+
+int
+sys_sem_wait(void)
+{
+  int id;
+  if(argint(0, &id) < 0)
+    return -1;
+  return ksem_wait(id);
+}
+
+int
+sys_sem_post(void)
+{
+  int id;
+  if(argint(0, &id) < 0)
+    return -1;
+  return ksem_post(id);
+}
+
+int
+sys_freepages(void)
+{
+  return getfreepages();
+}
+
+int
+sys_va2pa(void)
+{
+  int va;
+  if(argint(0, &va) < 0)
+    return -1;
+  return user_va2pa(myproc()->pgdir, (uint)va);
+}

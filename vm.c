@@ -53,6 +53,19 @@ walkpgdir(pde_t *pgdir, const void *va, int alloc)
   }
   return &pgtab[PTX(va)];
 }
+int
+user_va2pa(pde_t *pgdir, uint va)
+{
+  pte_t *pte;
+  pte = walkpgdir(pgdir, (char*)va, 0);
+  if(pte == 0)
+    return -1;
+  if((*pte & PTE_P) == 0)
+    return -1;
+  if((*pte & PTE_U) == 0)
+    return -1;
+  return PTE_ADDR(*pte) + (va & (PGSIZE - 1));
+}
 
 // Create PTEs for virtual addresses starting at va that refer to
 // physical addresses starting at pa. va and size might not

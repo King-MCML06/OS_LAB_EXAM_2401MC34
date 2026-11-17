@@ -186,5 +186,12 @@ void            switchkvm(void);
 int             copyout(pde_t*, uint, void*, uint);
 void            clearpteu(pde_t *pgdir, char *uva);
 
+void seminit(void);
+int  ksem_init(int, int);
+int  ksem_wait(int);
+int  ksem_post(int);  
+int getfreepages(void);
+int user_va2pa(pde_t*, uint);
+
 // number of elements in fixed-size array
 #define NELEM(x) (sizeof(x)/sizeof((x)[0]))

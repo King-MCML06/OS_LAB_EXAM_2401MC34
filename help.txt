@@ -1,0 +1,1437 @@
+# **MA3105 Operating System Lab Examination — Step-by-step solution**
+
+I have gone through the uploaded question paper. It contains **two questions**, each worth 10 marks:
+
+1. **Counting Semaphores for Process Synchronization** — implement three system calls and write `synctest.c` to enforce the order `A B C A B C ...`.
+2. **Memory Statistics and Address Translation** — implement `freepages()` and `va2pa()`, then write `memtest.c` to test physical memory allocation and address translation.&#x20;
+
+   Lab_MA3105 (1).PDF
+
+
+
+We'll solve both using the **xv6-public (x86)** structure specified in the paper. I'll show which files to edit, the code to add, how the system calls connect to the kernel, and how to compile and test each question.
+
+**Important:** Use the unmodified xv6 copy provided by the invigilator, as the paper instructs. The solution below is for this exam paper, not the earlier Assignment 10.
+
+## **Part 1 — Question 1: Counting Semaphores**
+
+### **Step 1. Understand what we need to implement**
+
+We need a kernel-level table containing 8 semaphores, with IDs from 0 to 7.
+
+Each semaphore stores:
+
+| Field   | Meaning                                    |
+| ------- | ------------------------------------------ |
+| `value` | Current semaphore count                    |
+| `inuse` | Whether the semaphore has been initialized |
+
+We need three system calls:
+
+| System call           | Function                                       |
+| --------------------- | ---------------------------------------------- |
+| `sem_init(id, value)` | Initialize a semaphore                         |
+| `sem_wait(id)`        | Decrement its value, or block if it is zero    |
+| `sem_post(id)`        | Increment its value and wake waiting processes |
+
+The key synchronization rule is:
+
+- `sem_wait()` must sleep when the value is zero.
+- `sem_post()` must wake waiting processes.
+- Both operations must use the **same spinlock** to prevent lost wake-ups.
+
+The question explicitly requires this locking behaviour.&#x20;
+
+Lab_MA3105 (1).PDF
+
+
+
+### **Step 2. Create&#x20;**`sem.c`
+
+Navigate to your xv6 directory:
+
+```
+cd ~/XVOS/xv6-public
+```
+
+Create a new file:
+
+```
+touch sem.c
+```
+
+Add the following implementation.
+
+```
+
+#include "types.h"
+#include "defs.h"
+#include "param.h"
+#include "spinlock.h"
+
+#define NSEMS 8
+
+// Semaphore table
+static struct {
+  struct spinlock lock;
+
+  struct {
+    int value;
+    int inuse;
+  } sem[NSEMS];
+
+} semtable;
+
+// Initialize semaphore table and its spinlock
+void
+seminit(void)
+{
+  int i;
+
+  initlock(&semtable.lock, "semtable");
+
+  for(i = 0; i < NSEMS; i++) {
+    semtable.sem[i].value = 0;
+    semtable.sem[i].inuse = 0;
+  }
+}
+
+// Initialize a semaphore
+int
+ksem_init(int id, int value)
+{
+  if(id < 0 || id >= NSEMS || value < 0)
+    return -1;
+
+  acquire(&semtable.lock);
+
+  semtable.sem[id].value = value;
+  semtable.sem[id].inuse = 1;
+
+  release(&semtable.lock);
+
+  return 0;
+}
+
+// Wait operation
+int
+ksem_wait(int id)
+{
+  if(id < 0 || id >= NSEMS)
+    return -1;
+
+  acquire(&semtable.lock);
+
+  if(semtable.sem[id].inuse == 0) {
+    release(&semtable.lock);
+    return -1;
+  }
+
+  // Recheck the value after every wake-up.
+  while(semtable.sem[id].value == 0) {
+    sleep(&semtable.sem[id], &semtable.lock);
+  }
+
+  semtable.sem[id].value--;
+
+  release(&semtable.lock);
+
+  return 0;
+}
+
+// Post operation
+int
+ksem_post(int id)
+{
+  if(id < 0 || id >= NSEMS)
+    return -1;
+
+  acquire(&semtable.lock);
+
+  if(semtable.sem[id].inuse == 0) {
+    release(&semtable.lock);
+    return -1;
+  }
+
+  semtable.sem[id].value++;
+
+  wakeup(&semtable.sem[id]);
+
+  release(&semtable.lock);
+
+  return 0;
+}
+
+```
+
+**Understand the important part of&#x20;**`ksem_wait()`**:**
+
+```
+while(semtable.sem[id].value == 0) {
+    sleep(&semtable.sem[id], &semtable.lock);
+}
+```
+
+Here:
+
+- `&semtable.sem[id]` is the channel on which the process sleeps.
+- `&semtable.lock` is the lock passed to `sleep()`.
+- `sleep()` atomically releases the lock while sleeping and reacquires it before returning.
+- The `while` loop checks the value again after waking up.
+
+We use a `while`, rather than an `if`, because multiple processes may wake up for the same semaphore, but only one may successfully decrement its value.
+
+Similarly, `sem_post()` increments the value and calls `wakeup()` while holding the same lock.
+
+### **Step 3. Initialize the semaphore table in&#x20;**`main.c`
+
+Open:
+
+```
+nano main.c
+```
+
+Find the `main()` function.
+
+Add this call:
+
+```
+seminit();
+```
+
+A suitable place is after `pinit()` and before `userinit()`.
+
+For example:
+
+```
+pinit();
+seminit();
+tvinit();
+```
+
+The exact surrounding order can differ slightly in your copy. The important point is that `seminit()` must run before user processes can invoke semaphore system calls.
+
+Now open `defs.h`:
+
+```
+nano defs.h
+```
+
+Add these declarations:
+
+```
+// semaphore functions
+void seminit(void);
+int ksem_init(int, int);
+int ksem_wait(int);
+int ksem_post(int);
+```
+
+### **Step 4. Add the system call numbers**
+
+Open:
+
+```
+nano syscall.h
+```
+
+In standard xv6-public, the existing system calls occupy numbers 1 through 21.
+
+Add:
+
+```
+#define SYS_sem_init  22
+#define SYS_sem_wait  23
+#define SYS_sem_post  24
+```
+
+Use unused numbers if your provided copy has a different syscall table.
+
+### **Step 5. Implement the system call handlers in&#x20;**`sysproc.c`
+
+Open:
+
+```
+nano sysproc.c
+```
+
+Add the following functions:
+
+```
+
+int
+sys_sem_init(void)
+{
+  int id, value;
+
+  if(argint(0, &id) < 0)
+    return -1;
+
+  if(argint(1, &value) < 0)
+    return -1;
+
+  return ksem_init(id, value);
+}
+
+int
+sys_sem_wait(void)
+{
+  int id;
+
+  if(argint(0, &id) < 0)
+    return -1;
+
+  return ksem_wait(id);
+}
+
+int
+sys_sem_post(void)
+{
+  int id;
+
+  if(argint(0, &id) < 0)
+    return -1;
+
+  return ksem_post(id);
+}
+
+```
+
+What is happening here?
+
+For example, when a user program calls:
+
+```
+sem_init(0, 1);
+```
+
+The handler uses `argint()` to retrieve the two arguments from the user process and passes them to the kernel implementation.
+
+### **Step 6. Register the system calls in&#x20;**`syscall.c`
+
+Open:
+
+```
+nano syscall.c
+```
+
+Add these function declarations near the other `extern` declarations:
+
+```
+extern int sys_sem_init(void);
+extern int sys_sem_wait(void);
+extern int sys_sem_post(void);
+```
+
+Then find the `syscalls[]` table and add:
+
+```
+[SYS_sem_init] sys_sem_init,
+[SYS_sem_wait] sys_sem_wait,
+[SYS_sem_post] sys_sem_post,
+```
+
+This table maps a system call number to its corresponding kernel handler.
+
+### **Step 7. Add the user-level declarations in&#x20;**`user.h`
+
+Open:
+
+```
+nano user.h
+```
+
+Add:
+
+```
+int sem_init(int, int);
+int sem_wait(int);
+int sem_post(int);
+```
+
+### **Step 8. Add the system call entry points in&#x20;**`usys.S`
+
+Open:
+
+```
+nano usys.S
+```
+
+At the end, add:
+
+```
+SYSCALL(sem_init)
+SYSCALL(sem_wait)
+SYSCALL(sem_post)
+```
+
+This generates the assembly wrappers that allow user programs to invoke the system calls.
+
+### **Step 9. Update the Makefile**
+
+Open:
+
+```
+nano Makefile
+```
+
+Find the kernel object list called `OBJS`.
+
+Add:
+
+```
+sem.o\
+```
+
+Make sure it follows the same continuation style as the other entries.
+
+Then find `UPROGS` and add:
+
+```
+_synctest\
+```
+
+The new `sem.c` must be compiled into the kernel, while `synctest.c` must be compiled as a user program.
+
+### **Step 10. Create&#x20;**`synctest.c`
+
+This program will create three children:
+
+- Child A prints `A` five times.
+- Child B prints `B` five times.
+- Child C prints `C` five times.
+
+We initialize the semaphores as follows:
+
+| Semaphore | Initial value | Purpose           |
+| --------- | ------------- | ----------------- |
+| 0         | 1             | Allows A to start |
+| 1         | 0             | Allows B after A  |
+| 2         | 0             | Allows C after B  |
+
+Create the file:
+
+```
+touch synctest.c
+```
+
+Add:
+
+```
+
+#include "types.h"
+#include "stat.h"
+#include "user.h"
+
+int
+main(void)
+{
+  int pid;
+  int i;
+
+  // Initialize semaphores
+  if(sem_init(0, 1) < 0 ||
+     sem_init(1, 0) < 0 ||
+     sem_init(2, 0) < 0) {
+    printf(1, "Semaphore initialization failed\n");
+    exit();
+  }
+
+  // Child A
+  pid = fork();
+
+  if(pid == 0) {
+    for(i = 0; i < 5; i++) {
+      sem_wait(0);
+      printf(1, "A");
+      sem_post(1);
+    }
+    exit();
+  }
+
+  if(pid < 0) {
+    printf(1, "Fork failed\n");
+    exit();
+  }
+
+  // Child B
+  pid = fork();
+
+  if(pid == 0) {
+    for(i = 0; i < 5; i++) {
+      sem_wait(1);
+      printf(1, "B");
+      sem_post(2);
+    }
+    exit();
+  }
+
+  if(pid < 0) {
+    printf(1, "Fork failed\n");
+    exit();
+  }
+
+  // Child C
+  pid = fork();
+
+  if(pid == 0) {
+    for(i = 0; i < 5; i++) {
+      sem_wait(2);
+      printf(1, "C");
+      sem_post(0);
+    }
+    exit();
+  }
+
+  if(pid < 0) {
+    printf(1, "Fork failed\n");
+    exit();
+  }
+
+  // Parent waits for all three children
+  for(i = 0; i < 3; i++)
+    wait();
+
+  printf(1, "\nDone\n");
+
+  exit();
+}
+
+```
+
+### **Step 11. Understand how the synchronization works**
+
+The execution cycle is:
+
+**A**
+
+`sem_wait(0)` → print A → `sem_post(1)`
+
+**B**
+
+`sem_wait(1)` → print B → `sem_post(2)`
+
+**C**
+
+`sem_wait(2)` → print C → `sem_post(0)`
+
+**Back to A — repeat five times**
+
+Initially, only semaphore 0 has a positive value. Therefore, only A can print.
+
+After A prints, it posts semaphore 1, allowing B to print. B then posts semaphore 2, allowing C to print. C posts semaphore 0, allowing A to print again.
+
+This guarantees the order without using `sleep()` or busy waiting in user code.
+
+### **Step 12. Compile and test Question 1**
+
+In your xv6 terminal:
+
+```
+make clean
+make qemu-nox CPUS=1
+```
+
+Once the xv6 shell appears:
+
+```
+$ echo YOUR_ROLL_NUMBER
+$ synctest
+```
+
+Expected output:
+
+```
+ABCABCABCABCABC
+
+Done
+```
+
+Q1 complete
+
+## **Part 2 — Question 2: Memory Statistics and Address Translation**
+
+### **Step 1. Understand what we need to implement**
+
+This question asks us to implement two system calls:
+
+| System call   | Purpose                                                                 |
+| ------------- | ----------------------------------------------------------------------- |
+| `freepages()` | Returns the number of currently free physical memory pages              |
+| `va2pa(va)`   | Converts a user virtual address into its corresponding physical address |
+
+We will also create `memtest.c` to test:
+
+1. Free pages at program startup.
+2. Free pages after allocating 10 pages using `sbrk()`.
+3. Virtual and physical addresses of a global variable.
+4. Translation of an invalid address (`0x7FFFFFFF`).
+5. Physical addresses of the same global variable in the parent and child after `fork()`.
+6. Free-page counts after `fork()` and after the child exits and is reaped.
+
+These are the exact checks requested in Question 2.&#x20;
+
+Lab_MA3105 (1).PDF
+
+
+
+### **Step 2. Modify&#x20;**`kalloc.c`**&#x20;to maintain the free-page count**
+
+Open:
+
+```
+nano kalloc.c
+```
+
+Find the `kmem` structure. In standard xv6-public, it looks similar to:
+
+```
+struct {
+  struct spinlock lock;
+  int use_lock;
+  struct run *freelist;
+} kmem;
+```
+
+Add a new field called `nfree`:
+
+```
+struct {
+  struct spinlock lock;
+  int use_lock;
+  struct run *freelist;
+  int nfree;
+} kmem;
+```
+
+This variable will store the number of free physical pages.
+
+**Why do we need this?**
+
+Every time `kalloc()` removes a page from the free list, we decrement the counter.
+
+Every time `kfree()` returns a page to the free list, we increment the counter.
+
+### **Step 3. Initialize the counter in&#x20;**`kinit1()`
+
+Find the function:
+
+```
+void
+kinit1(void *vstart, void *vend)
+```
+
+It should contain something similar to:
+
+```
+initlock(&kmem.lock, "kmem");
+kmem.use_lock = 0;
+```
+
+Add:
+
+```
+kmem.nfree = 0;
+```
+
+The beginning of the function should now look like:
+
+```
+void
+kinit1(void *vstart, void *vend)
+{
+  initlock(&kmem.lock, "kmem");
+
+  kmem.use_lock = 0;
+  kmem.nfree = 0;
+
+  freerange(vstart, vend);
+}
+```
+
+This initialization is important because `freerange()` calls `kfree()` to populate the initial free list. Our counter must start at zero before those pages are added.
+
+### **Step 4. Modify&#x20;**`kalloc()`
+
+Find the existing function:
+
+```
+char*
+kalloc(void)
+```
+
+Its job is to remove one page from the free list.
+
+Modify the part that removes the page as follows:
+
+```
+char*
+kalloc(void)
+{
+  struct run *r;
+
+  if(kmem.use_lock)
+    acquire(&kmem.lock);
+
+  r = kmem.freelist;
+
+  if(r) {
+    kmem.freelist = r->next;
+    kmem.nfree--;
+  }
+
+  if(kmem.use_lock)
+    release(&kmem.lock);
+
+  if(r)
+    memset((char*)r, 5, PGSIZE);
+
+  return (char*)r;
+}
+```
+
+**What changed?**
+
+We added:
+
+```
+if(r) {
+    kmem.freelist = r->next;
+    kmem.nfree--;
+}
+```
+
+We decrement only when allocation succeeds. Otherwise, the counter would become negative if the free list were empty.
+
+### **Step 5. Modify&#x20;**`kfree()`
+
+Now find:
+
+```
+void
+kfree(char *v)
+```
+
+Its job is to return a physical page to the free list.
+
+Keep the existing validity checks and `memset()` operation. Modify the section that inserts the page into the free list:
+
+```
+if(kmem.use_lock)
+  acquire(&kmem.lock);
+
+r = (struct run*)v;
+
+r->next = kmem.freelist;
+kmem.freelist = r;
+
+kmem.nfree++;
+
+if(kmem.use_lock)
+  release(&kmem.lock);
+```
+
+The important addition is:
+
+```
+kmem.nfree++;
+```
+
+We increment the count whenever a page is successfully returned to the free list.
+
+**Important locking detail:** We update `nfree` under the same lock that protects the free list after `kmem.use_lock` becomes active. During early boot, xv6 deliberately operates without this lock, so the counter is also updated without it.
+
+### **Step 6. Implement a helper function to read the counter**
+
+Still in `kalloc.c`, add the following function:
+
+```
+int
+getfreepages(void)
+{
+  int count;
+
+  if(kmem.use_lock)
+    acquire(&kmem.lock);
+
+  count = kmem.nfree;
+
+  if(kmem.use_lock)
+    release(&kmem.lock);
+
+  return count;
+}
+```
+
+This function safely reads the current number of free pages.
+
+Add its declaration to `defs.h`:
+
+```
+int getfreepages(void);
+```
+
+### **Step 7. Implement virtual-to-physical translation in&#x20;**`vm.c`
+
+Open:
+
+```
+nano vm.c
+```
+
+We will use the existing function:
+
+```
+walkpgdir()
+```
+
+This function searches the two-level page table and returns a pointer to the page-table entry (PTE) corresponding to a virtual address.
+
+However, `walkpgdir()` is declared `static`, meaning it cannot be called directly from another C file.
+
+The question specifically asks us to create a helper function in `vm.c` and declare it in `defs.h`.&#x20;
+
+Lab_MA3105 (1).PDF
+
+
+
+Add this helper function in `vm.c`, after the definition of `walkpgdir()`:
+
+```
+
+int
+user_va2pa(pde_t *pgdir, uint va)
+{
+  pte_t *pte;
+
+  // Find the page table entry
+  pte = walkpgdir(pgdir, (char*)va, 0);
+
+  // Check whether the page exists
+  if(pte == 0)
+    return -1;
+
+  // Check whether the page is present
+  if((*pte & PTE_P) == 0)
+    return -1;
+
+  // Check whether the page is accessible from user mode
+  if((*pte & PTE_U) == 0)
+    return -1;
+
+  // Physical frame address + offset
+  return PTE_ADDR(*pte) + (va & (PGSIZE - 1));
+}
+
+```
+
+Let's understand the important parts.
+
+**1. Locate the PTE**
+
+```
+pte = walkpgdir(pgdir, (char*)va, 0);
+```
+
+The third argument is zero because we only want to inspect the page table. We do not want to allocate a new page-table page if one does not exist.
+
+**2. Check whether the page is present**
+
+```
+if((*pte & PTE_P) == 0)
+    return -1;
+```
+
+`PTE_P` indicates whether the page-table entry is present.
+
+**3. Check user accessibility**
+
+```
+if((*pte & PTE_U) == 0)
+    return -1;
+```
+
+`PTE_U` indicates whether the page is accessible from user mode.
+
+**4. Calculate the physical address**
+
+```
+return PTE_ADDR(*pte) + (va & (PGSIZE - 1));
+```
+
+Remember:
+
+\\[ \text{Physical Address} = \text{Physical Frame Address} + \text{Page Offset} \\]
+
+For xv6:
+
+\\[ PGSIZE = 4096 = 2^{12} \\]
+
+Therefore, the lower 12 bits represent the offset within the page.
+
+Add this declaration to `defs.h`:
+
+```
+int user_va2pa(pde_t*, uint);
+```
+
+### **Step 8. Assign system call numbers**
+
+Open:
+
+```
+nano syscall.h
+```
+
+Earlier, we used system call numbers 22, 23 and 24 for the semaphore calls.
+
+Add:
+
+```
+#define SYS_freepages 25
+#define SYS_va2pa     26
+```
+
+These numbers are distinct from the ones used in Question 1.
+
+### **Step 9. Implement the system call handlers in&#x20;**`sysproc.c`
+
+Open:
+
+```
+nano sysproc.c
+```
+
+Add:
+
+```
+int
+sys_freepages(void)
+{
+  return getfreepages();
+}
+
+int
+sys_va2pa(void)
+{
+  int va;
+
+  if(argint(0, &va) < 0)
+    return -1;
+
+  return user_va2pa(myproc()->pgdir, (uint)va);
+}
+```
+
+The first function simply returns the number of free pages.
+
+The second function:
+
+1. Retrieves the virtual address from the user program using `argint()`.
+2. Gets the current process's page directory using `myproc()->pgdir`.
+3. Calls our helper function in `vm.c`.
+4. Returns the translated physical address, or `-1`.
+
+### **Step 10. Register the system calls in&#x20;**`syscall.c`
+
+Open:
+
+```
+nano syscall.c
+```
+
+Add these declarations:
+
+```
+extern int sys_freepages(void);
+extern int sys_va2pa(void);
+```
+
+Then add the entries to the `syscalls[]` table:
+
+```
+[SYS_freepages] sys_freepages,
+[SYS_va2pa] sys_va2pa,
+```
+
+### **Step 11. Add declarations to&#x20;**`user.h`
+
+Open:
+
+```
+nano user.h
+```
+
+Add:
+
+```
+int freepages(void);
+int va2pa(int);
+```
+
+### **Step 12. Add entries to&#x20;**`usys.S`
+
+Open:
+
+```
+nano usys.S
+```
+
+Add:
+
+```
+SYSCALL(freepages)
+SYSCALL(va2pa)
+```
+
+At this point, the system call interfaces for both questions have been registered.
+
+### **Step 13. Create&#x20;**`memtest.c`
+
+Now we will write a user program that tests all the required functionalities.
+
+Create the file:
+
+```
+touch memtest.c
+```
+
+Use this implementation:
+
+```
+
+#include "types.h"
+#include "stat.h"
+#include "user.h"
+
+int global_var = 123;
+
+int
+main(void)
+{
+  int initial_free;
+  int after_sbrk;
+  int before_fork;
+  int after_fork;
+  int after_wait;
+
+  int va, pa;
+  int pid;
+  int p[2];
+
+  char *memory;
+  char token = 'x';
+
+  // 1. Free pages at startup
+  initial_free = freepages();
+
+  printf(1, "Free pages at startup: %d\n",
+         initial_free);
+
+  // 2. Allocate 10 pages using sbrk()
+  memory = sbrk(10 * 4096);
+
+  if(memory == (char*)-1) {
+    printf(1, "sbrk failed\n");
+    exit();
+  }
+
+  after_sbrk = freepages();
+
+  printf(1, "Free pages after allocating 10 pages: %d\n",
+         after_sbrk);
+
+  // 3. Translate the address of a global variable
+  va = (int)&global_var;
+  pa = va2pa(va);
+
+  printf(1, "Global variable virtual address: 0x%x\n", va);
+  printf(1, "Global variable physical address: 0x%x\n", pa);
+
+  // 4. Test an invalid/unmapped address
+  printf(1, "va2pa(0x7FFFFFFF) = %d\n",
+         va2pa(0x7FFFFFFF));
+
+  // Create a pipe to keep the child alive
+  // until the parent records freepages().
+  if(pipe(p) < 0) {
+    printf(1, "Pipe creation failed\n");
+    exit();
+  }
+
+  // Record the baseline immediately before fork
+  before_fork = freepages();
+
+  printf(1, "Free pages before fork: %d\n",
+         before_fork);
+
+  pid = fork();
+
+  if(pid < 0) {
+    printf(1, "Fork failed\n");
+    close(p[0]);
+    close(p[1]);
+    exit();
+  }
+
+  if(pid == 0) {
+    // Child process
+    int child_va;
+    int child_pa;
+
+    close(p[1]);
+
+    child_va = (int)&global_var;
+    child_pa = va2pa(child_va);
+
+    printf(1, "Child: virtual address = 0x%x\n",
+           child_va);
+
+    printf(1, "Child: physical address = 0x%x\n",
+           child_pa);
+
+    // Wait until parent has recorded freepages()
+    if(read(p[0], &token, 1) != 1) {
+      printf(1, "Pipe read failed\n");
+    }
+
+    close(p[0]);
+
+    exit();
+  }
+
+  // Parent process
+  close(p[0]);
+
+  printf(1, "Parent: virtual address = 0x%x\n",
+         va);
+
+  printf(1, "Parent: physical address = 0x%x\n",
+         va2pa(va));
+
+  // 5. Free pages after fork
+  after_fork = freepages();
+
+  printf(1, "Free pages after fork: %d\n",
+         after_fork);
+
+  // Allow child to exit
+  write(p[1], &token, 1);
+  close(p[1]);
+
+  // Wait for child to exit and be reaped
+  wait();
+
+  // 6. Free pages after child exit and wait
+  after_wait = freepages();
+
+  printf(1, "Free pages after child exit and wait: %d\n",
+         after_wait);
+
+  printf(1, "Free pages before fork were: %d\n",
+         before_fork);
+
+  if(after_wait == before_fork)
+    printf(1, "Memory successfully reclaimed. No leak detected.\n");
+  else
+    printf(1, "Free page count mismatch!\n");
+
+  exit();
+}
+
+```
+
+### **Step 14. Understand the important parts of&#x20;**`memtest.c`
+
+**A. Allocating 10 pages**
+
+```
+memory = sbrk(10 * 4096);
+```
+
+Since every physical page is 4096 bytes, we request:
+
+\\[ 10 \times 4096 = 40960 \text{ bytes} \\]
+
+This should consume 10 free physical pages in this xv6 setup.
+
+Therefore, we expect:
+
+\\[ F\_{\text{after sbrk}} = F\_{\text{initial}} - 10 \\]
+
+**B. Translating the global variable's address**
+
+```
+va = (int)&global_var;
+pa = va2pa(va);
+```
+
+Here:
+
+- `va` is the virtual address of the global variable.
+- `pa` is its physical address.
+
+Our system call uses the current process's page table to translate the address.
+
+**C. Testing an invalid address**
+
+```
+va2pa(0x7FFFFFFF);
+```
+
+The address is intentionally selected because it should not be mapped in this small user process.
+
+We expect:
+
+```
+-1
+```
+
+**D. Why are we using a pipe?**
+
+This is an important detail.
+
+We want to measure how many pages remain free while the child process is still alive.
+
+Without synchronization, the child might exit before the parent calls `freepages()`. The measured value would then fail to represent the state immediately after `fork()`.
+
+We therefore use:
+
+```
+read(p[0], &token, 1);
+```
+
+The child blocks until the parent sends a byte through the pipe.
+
+The parent first records:
+
+```
+after_fork = freepages();
+```
+
+Only then does it release the child:
+
+```
+write(p[1], &token, 1);
+```
+
+This ensures that the child is still alive when the parent measures the free-page count.
+
+**E. Why should the physical addresses be different?**
+
+In xv6-public, `fork()` calls `copyuvm()` to create a separate copy of the parent's user address space.
+
+Therefore:
+
+- The global variable has the same virtual address in both processes.
+- Its physical page is different in the parent and child.
+
+Conceptually:
+
+**Parent process**
+
+Virtual address: `0x00102000`
+
+Physical address: `0x00200000`
+
+**Child process**
+
+Virtual address: `0x00102000`
+
+Physical address: `0x00300000`
+
+Illustrative addresses only. Actual addresses depend on the running system.
+
+**F. Why should free pages return to their earlier value?**
+
+When the child exits and the parent calls:
+
+```
+wait();
+```
+
+xv6 reclaims the child's allocated resources.
+
+Therefore, assuming all resources have been released correctly:
+
+\\[ F\_{\text{after wait}} = F\_{\text{before fork}} \\]
+
+This is the test for memory reclamation and leaks.
+
+### **Step 15. Update the Makefile**
+
+Open:
+
+```
+nano Makefile
+```
+
+In `UPROGS`, make sure both programs are included:
+
+```
+_synctest\
+_memtest\
+```
+
+You should also have:
+
+```
+sem.o\
+```
+
+in the kernel `OBJS` list.
+
+You do not need to add `memtest.o` to `OBJS`: it is a user program, not a kernel source file.
+
+### **Step 16. Compile and test Question 2**
+
+Return to the xv6 directory:
+
+```
+cd ~/XVOS/xv6-public
+```
+
+Compile and boot using the command specified in your examination paper:
+
+```
+make clean
+make qemu-nox CPUS=1
+```
+
+Once xv6 boots, execute:
+
+```
+$ echo YOUR_ROLL_NUMBER
+$ memtest
+```
+
+A typical output should look conceptually like this:
+
+```
+Free pages at startup:  ...
+Free pages after allocating 10 pages: ...
+Global variable virtual address: ...
+Global variable physical address: ...
+va2pa(0x7FFFFFFF) = -1
+
+Free pages before fork: ...
+Child: virtual address = ...
+Child: physical address = ...
+Parent: virtual address = ...
+Parent: physical address = ...
+Free pages after fork: ...
+Free pages after child exit and wait: ...
+Free pages before fork were: ...
+
+Memory successfully reclaimed. No leak detected.
+```
+
+The actual addresses and page counts depend on the xv6 memory configuration.
+
+Q2 complete
+
+## **Part 3 — Final verification checklist**
+
+Before submitting, make sure the following conditions hold.
+
+### **Question 1: Semaphores**
+
+- Exactly 8 semaphore entries, IDs 0–7.
+- Semaphore table protected by a spinlock.
+- `seminit()` called before user programs start.
+- `sem_init()` rejects invalid IDs and negative values.
+- `sem_wait()` blocks when the value is zero.
+- `sem_wait()` uses a `while` loop to recheck the value.
+- `sem_post()` increments the value and calls `wakeup()`.
+- `synctest` prints `ABCABCABCABCABC`.
+- Parent prints `Done` after all children exit.
+
+### **Question 2: Memory statistics and address translation**
+
+- `kalloc()` decrements the free-page counter.
+- `kfree()` increments the free-page counter.
+- Counter access uses `kmem.lock` when the lock is active.
+- `freepages()` returns the current free-page count.
+- `va2pa()` checks both `PTE_P` and `PTE_U`.
+- Invalid address translation returns `-1`.
+- Parent and child have the same virtual address for the global variable.
+- Parent and child have different physical addresses.
+- Free pages return to their pre-fork value after the child is reaped.
+
+## **Part 4 — Submission requirements**
+
+Your question paper specifies a folder named:
+
+```
+<RollNo>_Name/
+```
+
+It must contain the complete modified xv6 directory, source files, output evidence and `README.txt`.&#x20;
+
+Lab_MA3105 (1).PDF
+
+
+
+A suitable structure is:
+
+```
+<RollNo>_Name/
+│
+├── xv6/
+│   ├── Makefile
+│   ├── sem.c
+│   ├── kalloc.c
+│   ├── vm.c
+│   ├── main.c
+│   ├── defs.h
+│   ├── syscall.h
+│   ├── syscall.c
+│   ├── sysproc.c
+│   ├── user.h
+│   ├── usys.S
+│   ├── synctest.c
+│   └── memtest.c
+│
+├── Q1_output
+├── Q2_output
+└── README.txt
+```
+
+For each question, capture one screenshot or save a console log showing the corresponding program running. Make sure your roll number is visible before the test output.
+
+In `README.txt`, include:
+
+- Your name, roll number and set number.
+- Four to six lines describing the changes made for Q1.
+- Four to six lines describing the changes made for Q2.
+
+Finally, after testing, return to the directory containing `xv6/` and run:
+
+```
+cd xv6
+make clean
+cd ..
+tar czf <RollNo>_Set1.tar.gz xv6/
+```
+
+The examination instructions specifically request that the complete xv6 directory be cleaned before creating the archive.&#x20;
+
+Lab_MA3105 (1).PDF
+
+
+
+## **Part 5 — Common mistakes to avoid**
+
+| Mistake                                                   | What happens                                                |
+| --------------------------------------------------------- | ----------------------------------------------------------- |
+| Forgetting `seminit()` in `main.c`                        | Semaphore lock may be uninitialized                         |
+| Using `if` instead of `while` in `sem_wait()`             | Incorrect synchronization after wake-ups                    |
+| Not using the same lock for `sleep()` and `wakeup()`      | Possible lost wake-ups                                      |
+| Forgetting to update `nfree` in either allocator function | Incorrect free-page count                                   |
+| Updating `nfree` outside the allocator's critical section | Race conditions                                             |
+| Checking only `PTE_P` in `va2pa()`                        | May translate supervisor-only pages                         |
+| Not waiting for the child in `memtest`                    | Child resources may not be reclaimed                        |
+| Forgetting to add `_synctest` or `_memtest` to `UPROGS`   | User program may not be available in the xv6 shell          |
+| Forgetting `sem.o` in `OBJS`                              | Semaphore implementation will not be linked into the kernel |
+
+**One final recommendation:** Build after completing Q1, test `synctest`, and only then implement Q2. When adding Q2, retain the Q1 files and syscall numbers. This way, you can isolate compilation errors much more easily.

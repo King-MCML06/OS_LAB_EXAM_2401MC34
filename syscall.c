@@ -103,6 +103,11 @@ extern int sys_unlink(void);
 extern int sys_wait(void);
 extern int sys_write(void);
 extern int sys_uptime(void);
+extern int sys_sem_init(void);
+extern int sys_sem_wait(void);
+extern int sys_sem_post(void);
+extern int sys_freepages(void);
+extern int sys_va2pa(void);
 
 static int (*syscalls[])(void) = {
 [SYS_fork]    sys_fork,
@@ -126,6 +131,11 @@ static int (*syscalls[])(void) = {
 [SYS_link]    sys_link,
 [SYS_mkdir]   sys_mkdir,
 [SYS_close]   sys_close,
+[SYS_sem_init] sys_sem_init,
+[SYS_sem_wait] sys_sem_wait,
+[SYS_sem_post] sys_sem_post,
+[SYS_freepages] sys_freepages,
+[SYS_va2pa] sys_va2pa,
 };
 
 void
